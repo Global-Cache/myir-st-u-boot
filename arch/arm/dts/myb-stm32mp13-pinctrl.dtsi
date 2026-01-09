@@ -659,34 +659,4 @@
                                                  <STM32_PINMUX('F', 10, ANALOG)>; /* QUADSPI_CLK */
                         };
         };
-
-	usart3_pins_a: usart3-0 {
-		pins1 {
-			pinmux = <STM32_PINMUX('C', 10, AF7)>; /* USART3_TX */
-			bias-disable;
-			drive-push-pull;
-			slew-rate = <0>;
-		};
-		pins2 {
-			pinmux = <STM32_PINMUX('D', 2, AF7)>; /* USART3_RX */
-			bias-disable;
-		};
-	};
-
-	usart3_idle_pins_a: usart3-idle-0 {
-		pins1 {
-			pinmux = <STM32_PINMUX('C', 10, ANALOG)>; /* USART3_TX */
-		};
-		pins2 {
-			pinmux = <STM32_PINMUX('D', 2, AF7)>; /* USART3_RX */
-			bias-disable;
-		};
-	};
-
-	usart3_sleep_pins_a: usart3-sleep-0 {
-		pins {
-			pinmux = <STM32_PINMUX('C', 10, ANALOG)>, /* USART3_TX */
-				 <STM32_PINMUX('D', 2, ANALOG)>; /* USART3_RX */
-		};
-	};
 };
