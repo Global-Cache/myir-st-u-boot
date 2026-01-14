@@ -9,6 +9,7 @@
 #include <adc.h>
 #include <bootm.h>
 #include <clk.h>
+#include <command.h>
 #include <config.h>
 #include <dm.h>
 #include <env.h>
@@ -136,6 +137,251 @@ int checkboard(void)
 	}
 
 	return 0;
+}
+
+/*
+ * Reset button partition switch service
+ *
+ * Detects if the reset button (PE8, active low) is held at boot:
+ * - If held for 5 seconds: start LED signaling
+ * - If held for 30 seconds: toggle swset (boot partition) and reboot
+ *
+ * LED patterns (LED normally ON, signals via short OFF pulses):
+ * - 1 pulse every 1s: Partition B is available
+ * - 2 pulses in sequence: Button held, countdown in progress
+ * - 3 pulses: Switch failed (partition B not populated)
+ * - 1 long pulse: Switch succeeded
+ */
+#define GPIO_RESET_BUTTON		"GPIOE8"
+#define GPIO_POWER_LED			"GPIOD12"
+
+#define RESET_BTN_DEBOUNCE_US		20
+#define RESET_BTN_POLL_MS		50
+#define RESET_BTN_SIGNAL_START_MS	5000
+#define RESET_BTN_ACTION_MS		30000
+
+/* LED timing (LED is normally ON, pulses are OFF) */
+#define LED_PULSE_OFF_MS		100	/* Duration of OFF pulse */
+#define LED_PULSE_GAP_MS		150	/* Gap between pulses in a sequence */
+#define LED_LONG_PULSE_MS		500	/* Long OFF pulse for success */
+#define LED_PATTERN_INTERVAL_MS		1000	/* Interval between pattern repetitions */
+
+/*
+ * Partition layout (GPT on mmc1):
+ *   6 = bootfs   (partition A boot files)
+ *   7 = bootfs_b (partition B boot files)
+ *   8 = rootfs   (partition A root filesystem)
+ *   9 = rootfs_b (partition B root filesystem)
+ */
+#define BOOTFS_A_PARTITION		6
+#define BOOTFS_B_PARTITION		7
+
+static int reset_button_get_gpios(struct gpio_desc *btn, struct gpio_desc *led)
+{
+	int ret;
+
+	log_notice("Reset button: looking up GPIO %s\n", GPIO_RESET_BUTTON);
+	ret = dm_gpio_lookup_name(GPIO_RESET_BUTTON, btn);
+	if (ret) {
+		log_notice("Reset button GPIO lookup failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = dm_gpio_request(btn, "reset_button");
+	if (ret) {
+		log_notice("Reset button GPIO request failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = dm_gpio_set_dir_flags(btn, GPIOD_IS_IN);
+	if (ret) {
+		log_notice("Reset button set direction failed: %d\n", ret);
+		dm_gpio_free(NULL, btn);
+		return ret;
+	}
+
+	ret = dm_gpio_lookup_name(GPIO_POWER_LED, led);
+	if (ret) {
+		log_notice("Power LED GPIO lookup failed: %d\n", ret);
+		dm_gpio_free(NULL, btn);
+		return ret;
+	}
+
+	ret = dm_gpio_request(led, "power_led");
+	if (ret) {
+		log_notice("Power LED GPIO request failed: %d\n", ret);
+		dm_gpio_free(NULL, btn);
+		return ret;
+	}
+
+	ret = dm_gpio_set_dir_flags(led, GPIOD_IS_OUT);
+	if (ret) {
+		log_notice("Power LED set direction failed: %d\n", ret);
+		dm_gpio_free(NULL, led);
+		dm_gpio_free(NULL, btn);
+		return ret;
+	}
+
+	log_notice("Reset button: GPIOs acquired successfully\n");
+	return 0;
+}
+
+static void reset_button_free_gpios(struct gpio_desc *btn, struct gpio_desc *led)
+{
+	dm_gpio_set_value(led, 0);
+	dm_gpio_free(NULL, led);
+	dm_gpio_free(NULL, btn);
+}
+
+/* Emit N short OFF pulses (LED normally ON) */
+static void led_pulse_pattern(struct gpio_desc *led, int num_pulses)
+{
+	int i;
+
+	for (i = 0; i < num_pulses; i++) {
+		dm_gpio_set_value(led, 0);	/* OFF */
+		mdelay(LED_PULSE_OFF_MS);
+		dm_gpio_set_value(led, 1);	/* ON */
+		if (i < num_pulses - 1)
+			mdelay(LED_PULSE_GAP_MS);
+	}
+}
+
+/* Check if target partition has been populated by verifying bootfs is readable */
+static int is_target_partition_valid(void)
+{
+	const char *swset;
+	char cmd[64];
+	int target_part;
+	int ret;
+
+	swset = env_get("swset");
+
+	/*
+	 * Determine which partition we'd switch TO:
+	 * - If swset=1 (or unset), we'd switch to partition 2 (bootfs_b = part 7)
+	 * - If swset=2, we'd switch to partition 1 (bootfs = part 6)
+	 */
+	if (!swset || strcmp(swset, "1") == 0) {
+		target_part = BOOTFS_B_PARTITION;
+		log_notice("Would switch to partition B, checking bootfs_b (mmc 1:%d)...\n",
+			   target_part);
+	} else {
+		target_part = BOOTFS_A_PARTITION;
+		log_notice("Would switch to partition A, checking bootfs (mmc 1:%d)...\n",
+			   target_part);
+	}
+
+	/*
+	 * Check if target bootfs has valid files by trying to load fitImage.
+	 * If the partition is empty/unformatted, this will fail.
+	 * We load just 1 byte to a safe memory location to test existence.
+	 */
+	snprintf(cmd, sizeof(cmd), "load mmc 1:%d 0xc0000000 /fitImage 1", target_part);
+	ret = run_command(cmd, 0);
+	if (ret != 0) {
+		log_notice("Target partition check failed - fitImage not found\n");
+		return 0;
+	}
+
+	log_notice("Target partition is valid\n");
+	return 1;
+}
+
+static void check_reset_button(void)
+{
+	struct gpio_desc reset_btn, power_led;
+	ulong start, elapsed;
+	ulong last_pattern_time = 0;
+	int signaling = 0;
+	int partb_valid;
+	int btn_value;
+
+	log_notice("Reset button: checking for recovery mode...\n");
+
+	if (reset_button_get_gpios(&reset_btn, &power_led))
+		return;
+
+	/* LED starts ON */
+	dm_gpio_set_value(&power_led, 1);
+
+	/* Debounce delay */
+	udelay(RESET_BTN_DEBOUNCE_US);
+
+	/* Check if button is pressed (active low - pressed = 0) */
+	btn_value = dm_gpio_get_value(&reset_btn);
+	log_notice("Reset button: GPIO value = %d (0 = pressed)\n", btn_value);
+	if (btn_value != 0) {
+		reset_button_free_gpios(&reset_btn, &power_led);
+		return;
+	}
+
+	log_notice("Reset button pressed, hold for recovery...\n");
+
+	/* Pre-check if target partition is valid while user is holding */
+	partb_valid = is_target_partition_valid();
+
+	start = get_timer(0);
+
+	while ((elapsed = get_timer(start)) < RESET_BTN_ACTION_MS) {
+		/* Check if button released */
+		if (dm_gpio_get_value(&reset_btn) != 0) {
+			log_notice("Reset button released after %lums - no action\n", elapsed);
+			dm_gpio_set_value(&power_led, 1);  /* Ensure LED is ON */
+			reset_button_free_gpios(&reset_btn, &power_led);
+			return;
+		}
+
+		/* Start signaling after 5 seconds */
+		if (!signaling && elapsed >= RESET_BTN_SIGNAL_START_MS) {
+			signaling = 1;
+			last_pattern_time = get_timer(0);
+
+			/* Show initial pattern based on target partition validity */
+			if (partb_valid) {
+				/* 1 pulse = target partition available */
+				log_notice("5s reached - target partition valid, continue holding to switch...\n");
+				led_pulse_pattern(&power_led, 1);
+			} else {
+				/* 3 pulses = target partition invalid - abort immediately */
+				log_notice("5s reached - target partition NOT valid, aborting\n");
+				led_pulse_pattern(&power_led, 3);
+				mdelay(300);
+				led_pulse_pattern(&power_led, 3);
+				mdelay(300);
+				led_pulse_pattern(&power_led, 3);
+				dm_gpio_set_value(&power_led, 1);  /* LED back ON */
+				reset_button_free_gpios(&reset_btn, &power_led);
+				return;
+			}
+		}
+
+		/* Repeat pattern every 1 second while signaling */
+		if (signaling && (get_timer(last_pattern_time) >= LED_PATTERN_INTERVAL_MS)) {
+			last_pattern_time = get_timer(0);
+			/* 2 pulses = countdown in progress */
+			led_pulse_pattern(&power_led, 2);
+		}
+
+		mdelay(RESET_BTN_POLL_MS);
+	}
+
+	/* 30 seconds reached - perform partition switch */
+	log_notice("30s reached - switching partition\n");
+
+	/* Use the switchpart env command which also sets ustate=3 */
+	run_command("run switchpart", 0);
+	log_notice("Boot partition (swset) is now: %s\n", env_get("swset"));
+
+	/* 1 long pulse = success */
+	dm_gpio_set_value(&power_led, 0);	/* OFF */
+	mdelay(LED_LONG_PULSE_MS);
+	dm_gpio_set_value(&power_led, 1);	/* ON */
+	mdelay(200);
+
+	reset_button_free_gpios(&reset_btn, &power_led);
+	log_notice("Rebooting...\n");
+	do_reset(NULL, 0, 0, NULL);
 }
 
 static void board_key_check(void)
@@ -883,6 +1129,9 @@ int board_late_init(void)
 	char buf[10];
 	char dtb_name[256];
 	int buf_len;
+
+	/* Check for reset button hold to switch boot partition */
+	check_reset_button();
 
 	if (board_is_stm32mp13x_dk())
 		board_stm32mp13x_dk_init();
